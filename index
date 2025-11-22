@@ -1,0 +1,600 @@
+import React, { useState, useCallback, useMemo, useRef } from 'react';
+import { 
+    FileUp, 
+    FileText, 
+    Shield, // Changed Key to Shield for the "Armour" logo
+    AlertTriangle, 
+    CheckCircle, 
+    Hourglass, 
+    XCircle, 
+    Printer, 
+    ChevronsDown 
+} from 'lucide-react';
+
+// --- Gemini API Configuration ---
+// The API key and URL will be provided by the Canvas environment at runtime.
+const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
+const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent`;
+const API_KEY = ""; // This remains empty; handled by the environment.
+
+// Define the expected structure for the AI's safety report using a JSON Schema
+const REPORT_SCHEMA = {
+    type: "OBJECT",
+    properties: {
+        score: {
+            type: "INTEGER",
+            description: "A safety score from 0 (very risky) to 100 (very safe)."
+        },
+        summary: {
+            type: "STRING",
+            description: "A concise, plain-language summary of the document's overall safety."
+        },
+        risks: {
+            type: "ARRAY",
+            description: "List of key risk factors identified in the document.",
+            items: {
+                type: "OBJECT",
+                properties: {
+                    title: { type: "STRING" },
+                    description: { type: "STRING" },
+                    severity: { type: "STRING", enum: ["Low", "Medium", "High"] }
+                }
+            }
+        },
+        keyTerms: {
+            type: "ARRAY",
+            description: "List of key terms and their simple explanations.",
+            items: {
+                type: "OBJECT",
+                properties: {
+                    term: { type: "STRING" },
+                    explanation: { type: "STRING" }
+                }
+            }
+        },
+        privacyPolicy: {
+            type: "OBJECT",
+            description: "Specific analysis on data handling, if applicable.",
+            properties: {
+                dataCollected: { type: "STRING", description: "What specific data is collected?" },
+                thirdPartySharing: { type: "STRING", description: "Is data shared with third parties? If so, briefly explain." },
+                dataRetention: { type: "STRING", description: "How long is data retained or how is retention determined?" }
+            }
+        }
+    },
+    required: ["score", "summary", "risks", "keyTerms"]
+};
+
+// --- Utility Functions ---
+
+/** Converts a File object to a Base64 string for the Gemini API payload. */
+const fileToGenerativePart = (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            if (typeof reader.result === 'string') {
+                // The result is 'data:mime/type;base64,BASE64_DATA'
+                const base64Data = reader.result.split(',')[1];
+                resolve({
+                    inlineData: {
+                        data: base64Data,
+                        mimeType: file.type
+                    }
+                });
+            } else {
+                reject(new Error("Failed to read file as string."));
+            }
+        };
+        reader.onerror = (error) => reject(error);
+        reader.readAsDataURL(file);
+    });
+};
+
+/** Handles the Gemini API call with structured output and exponential backoff. */
+const analyzeDocument = async (parts) => {
+    const systemPrompt = `You are "Exoner," a world-class legal linguistic analyst. Your job is to analyze any uploaded document (contract, agreement, policy, or a photograph of one) and immediately break down the legal jargon into a clear, consumer-friendly safety report.
+    1. Determine a comprehensive safety score (0-100) based on risks, clarity, and fairness.
+    2. Identify and simplify the key legal terms.
+    3. Identify and rate the specific risks (e.g., hidden fees, liability clauses, data sharing) as Low, Medium, or High severity.
+    4. Provide a detailed summary of the privacy policy, focusing on data collection, sharing, and retention.
+    5. Your output MUST be a JSON object adhering strictly to the provided schema. Do not include any pre-amble, explanation, or markdown formatting outside of the JSON object itself.`;
+
+    const userQuery = "Please analyze this document/image. Break down all legal linguistics and prepare a comprehensive safety report, focusing on what is actually at stake for the consumer and if the agreement is worth it based on the risks identified. Pay special attention to data collection and liability clauses.";
+
+    const payload = {
+        contents: [{
+            parts: [...parts, { text: userQuery }]
+        }],
+        systemInstruction: {
+            parts: [{ text: systemPrompt }]
+        },
+        generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: REPORT_SCHEMA,
+            temperature: 0.1
+        },
+    };
+
+    // FIX: Construct the URL without the redundant '?key=' parameter if API_KEY is empty.
+    const fullApiUrl = API_URL + (API_KEY ? `?key=${API_KEY}` : '');
+
+    let response;
+    let retries = 0;
+    const maxRetries = 3;
+
+    while (retries < maxRetries) {
+        try {
+            response = await fetch(fullApiUrl, { // Use the corrected URL
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                // If status is 403 or other error, throw
+                throw new Error(`API call failed with status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+            if (jsonText) {
+                try {
+                    return JSON.parse(jsonText);
+                } catch (e) {
+                    console.error("Failed to parse JSON response:", e, jsonText);
+                    throw new Error("Invalid JSON response from model.");
+                }
+            } else {
+                throw new Error("No content received from model.");
+            }
+        } catch (error) {
+            console.error(`Attempt ${retries + 1} failed:`, error.message);
+            retries++;
+            if (retries < maxRetries) {
+                const delay = Math.pow(2, retries) * 1000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                throw new Error("Failed to get a valid response from the AI after multiple retries.");
+            }
+        }
+    }
+};
+
+// --- React Components ---
+
+const useSafetyScore = (score) => {
+    return useMemo(() => {
+        if (score >= 80) return { color: 'text-green-500', bgColor: 'bg-green-100', icon: CheckCircle, description: 'Very Safe: Highly favorable terms for the consumer.' };
+        if (score >= 60) return { color: 'text-lime-500', bgColor: 'bg-lime-100', icon: CheckCircle, description: 'Safe: Mostly fair terms, minimal low-level risks.' };
+        if (score >= 40) return { color: 'text-amber-500', bgColor: 'bg-amber-100', icon: AlertTriangle, description: 'Moderate Risk: Review medium-severity clauses carefully.' };
+        if (score >= 20) return { color: 'text-orange-500', bgColor: 'bg-orange-100', icon: AlertTriangle, description: 'High Risk: Contains significant clauses that heavily favor the other party.' };
+        return { color: 'text-red-500', bgColor: 'bg-red-100', icon: XCircle, description: 'Very High Risk: Proceed with extreme caution.' };
+    }, [score]);
+};
+
+// New component for the About page content
+const AboutPage = () => (
+    <section className="min-h-screen pt-24 pb-16 md:pt-32 md:pb-24 bg-gradient-to-br from-gray-50 to-indigo-50">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div className="bg-white rounded-xl shadow-2xl p-8 md:p-12 border border-indigo-200">
+                <h1 className="text-5xl font-extrabold text-gray-900 mb-6 border-b pb-4">
+                    Our Mission: Clarity for Everyone
+                </h1>
+                
+                <p className="text-lg text-gray-700 mb-8">
+                    Exoner was born out of a commitment to transparency and user empowerment. We fundamentally believe that everyone deserves to understand the legal terms they agree to, without needing a legal degree or expensive consultation.
+                </p>
+
+                <div className="bg-indigo-50 p-6 rounded-xl mb-8 border border-indigo-300">
+                    <p className="text-sm font-semibold uppercase text-indigo-600 mb-3">Project Code Name & Vision</p>
+                    <h2 className="text-4xl font-black text-indigo-800 tracking-wider">
+                        T 4921 ANDROMEDA
+                    </h2>
+                </div>
+
+                <h3 className="text-2xl font-semibold text-gray-800 mb-4">
+                    Removing the Legal Language Barrier
+                </h3>
+
+                <p className="text-lg text-gray-700 mb-6">
+                    The core goal of this project is simple: **to remove the need for lawyers to interpret all the terms and conditions for us**. We want users to be able to analyze and understand any agreement, regardless of whether they are familiar with legal jargon or not.
+                </p>
+                
+                <p className="text-lg text-gray-700 mb-6">
+                    Our AI platform instantly translates convoluted legal linguistics into plain, actionable, and easy-to-read safety reports. This provides you with an objective risk score and highlights the clauses that matter most to your safety and rights.
+                </p>
+
+                <ul className="space-y-3 text-gray-700 list-disc list-inside ml-4">
+                    <li>**Empowerment:** You get the control and understanding back into your own hands.</li>
+                    <li>**Protection:** Exoner acts as your digital shield against hidden clauses and confusing fine print.</li>
+                    <li>**Efficiency:** Get reliable legal insight in seconds, not days.</li>
+                </ul>
+
+                <p className="mt-8 text-xl font-bold text-indigo-700 border-t pt-4">
+                    Democratizing legal knowledge, one document at a time.
+                </p>
+            </div>
+        </div>
+    </section>
+);
+
+
+const App = () => {
+    const [file, setFile] = useState(null);
+    const [report, setReport] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [currentPage, setCurrentPage] = useState('home'); // State for navigation
+    
+    // Ref for scrolling to the analysis section
+    const analysisSectionRef = useRef(null);
+    // Ref for the printable report section
+    const reportRef = useRef(null);
+
+    const scoreData = useSafetyScore(report?.score || 0);
+
+    const handleFileChange = (event) => {
+        setError(null);
+        setReport(null);
+        if (event.target.files.length > 0) {
+            const uploadedFile = event.target.files[0];
+            
+            if (!['application/pdf', 'image/jpeg', 'image/png'].includes(uploadedFile.type)) {
+                setError("Unsupported file type. Please upload a PDF, JPEG, or PNG file of a document.");
+                setFile(null);
+                return;
+            }
+
+            setFile(uploadedFile);
+        } else {
+            setFile(null);
+        }
+    };
+
+    const handleAnalyze = useCallback(async () => {
+        if (!file) {
+            setError("Please select a file to analyze.");
+            return;
+        }
+
+        setLoading(true);
+        setError(null);
+        setReport(null);
+
+        try {
+            const part = await fileToGenerativePart(file);
+            const parsedReport = await analyzeDocument([part]);
+            setReport(parsedReport);
+        } catch (err) {
+            console.error("Analysis Error:", err);
+            setError(err.message || "An unknown error occurred during AI analysis. Please check the file content and try again.");
+        } finally {
+            setLoading(false);
+            // Scroll to report if generated
+            if (reportRef.current) {
+                reportRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
+    }, [file]);
+
+    const getRiskSeverityColor = (severity) => {
+        switch (severity) {
+            case 'High': return 'bg-red-500/20 text-red-700 border-red-500';
+            case 'Medium': return 'bg-orange-500/20 text-orange-700 border-orange-500';
+            case 'Low': return 'bg-lime-500/20 text-lime-700 border-lime-500';
+            default: return 'bg-gray-100 text-gray-700 border-gray-300';
+        }
+    };
+
+    const handleReset = () => {
+        setFile(null);
+        setReport(null);
+        setError(null);
+        setLoading(false);
+        document.getElementById('file-input').value = '';
+    };
+
+    const scrollToAnalysis = () => {
+        // Switch to the home page view and then scroll
+        setCurrentPage('home');
+        // A slight delay ensures the home page renders before scrolling
+        setTimeout(() => {
+            analysisSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 50);
+    };
+
+    const handlePrint = () => {
+        if (reportRef.current) {
+            const printContent = reportRef.current;
+            const printWindow = window.open('', '', 'height=600,width=800');
+            printWindow.document.write('<html><head><title>Exoner Safety Report</title>');
+            // Include Tailwind CSS for printing
+            printWindow.document.write('<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">');
+            printWindow.document.write('<style>@media print { body { -webkit-print-color-adjust: exact; } }</style>'); // For background colors
+            printWindow.document.write('</head><body>');
+            printWindow.document.write(printContent.innerHTML);
+            printWindow.document.write('</body></html>');
+            printWindow.document.close();
+            printWindow.focus();
+            printWindow.print();
+            printWindow.close();
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-50 font-sans text-gray-800">
+            <style>{`
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+                body { font-family: 'Inter', sans-serif; }
+
+                /* Hide print button when printing */
+                @media print {
+                    .no-print {
+                        display: none !important;
+                    }
+                }
+            `}</style>
+
+            {/* Navbar */}
+            <nav className="no-print fixed top-0 left-0 right-0 z-50 bg-white shadow-sm py-4 px-8 flex items-center justify-between">
+                <div className="flex items-center">
+                    <Shield className="w-6 h-6 mr-2 text-indigo-600" /> {/* Updated Icon */}
+                    <span className="text-xl font-extrabold text-gray-900">Exoner</span>
+                </div>
+                <div className="hidden md:flex items-center space-x-6">
+                    <a 
+                        href="#" 
+                        onClick={() => setCurrentPage('home')} 
+                        className={`transition-colors font-medium ${currentPage === 'home' ? 'text-indigo-600' : 'text-gray-600 hover:text-indigo-600'}`}
+                    >
+                        Home
+                    </a>
+                    <a 
+                        href="#" 
+                        onClick={() => setCurrentPage('about')} 
+                        className={`transition-colors font-medium ${currentPage === 'about' ? 'text-indigo-600' : 'text-gray-600 hover:text-indigo-600'}`}
+                    >
+                        Features
+                    </a>
+                    <a 
+                        href="#" 
+                        onClick={() => setCurrentPage('about')} 
+                        className={`transition-colors font-medium ${currentPage === 'about' ? 'text-indigo-600' : 'text-gray-600 hover:text-indigo-600'}`}
+                    >
+                        About
+                    </a>
+                </div>
+                <div className="flex items-center space-x-4">
+                    {/* Log In link removed */}
+                    <button 
+                        onClick={scrollToAnalysis}
+                        className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-colors"
+                    >
+                        Start Analysis
+                    </button>
+                </div>
+            </nav>
+
+            {/* Conditional Content Rendering */}
+            {currentPage === 'home' && (
+                <>
+                    {/* Hero Section */}
+                    <section className="relative pt-24 pb-16 md:pt-32 md:pb-24 bg-gradient-to-br from-indigo-50 to-purple-50 overflow-hidden">
+                        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="grid md:grid-cols-2 gap-12 items-center">
+                                {/* Left Content */}
+                                <div>
+                                    <p className="text-indigo-700 text-sm font-semibold mb-2">Document Risk Assessment</p>
+                                    <h1 className="text-5xl md:text-6xl font-extrabold leading-tight tracking-tight text-gray-900 mb-6">
+                                        AI-Driven Comprehensive <br className="hidden md:block" /> Legal Document Analysis Platform
+                                    </h1>
+                                    <p className="text-lg text-gray-600 mb-8">
+                                        Upload your legal documents and receive instant risk assessment with detailed analysis reports. Identify potential
+                                        hazards in contracts, agreements, and policies before they impact you.
+                                    </p>
+                                    <button 
+                                        onClick={scrollToAnalysis}
+                                        className="inline-flex items-center px-8 py-4 bg-indigo-600 hover:bg-indigo-700 text-white text-lg font-bold rounded-xl shadow-lg hover:shadow-xl transition-all"
+                                    >
+                                        Get Started <ChevronsDown className="w-5 h-5 ml-2" />
+                                    </button>
+                                </div>
+                                {/* Right Image/Illustration */}
+                                <div className="relative order-first md:order-last">
+                                    <div className="bg-white rounded-xl shadow-xl p-6 transform -rotate-3 hover:rotate-0 transition-transform duration-300 ease-in-out">
+                                        {/* Updated image to a tech-themed placeholder */}
+                                        <img 
+                                            src="https://placehold.co/600x400/312e81/ffffff?text=AI+Document+Shield" 
+                                            alt="AI-Powered Document Security" 
+                                            className="rounded-lg w-full h-auto object-cover" 
+                                        />
+                                        <p className="absolute bottom-4 right-4 text-xs text-gray-400 bg-white/70 px-2 py-1 rounded">AI Shield Protecting Data</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    {/* Analysis Section */}
+                    <section ref={analysisSectionRef} className="py-16 md:py-20 px-4 sm:px-6 lg:px-8 bg-white">
+                        <div className="max-w-4xl mx-auto">
+                            <h2 className="text-4xl font-extrabold text-gray-900 text-center mb-12">
+                                Start Your Document Analysis
+                            </h2>
+
+                            <div className="bg-white shadow-2xl rounded-xl p-6 md:p-10 border border-gray-200">
+                                <h3 className="text-2xl font-semibold text-gray-800 mb-6 border-b pb-3">1. Upload Document or Photo</h3>
+
+                                <div className="flex flex-col space-y-4">
+                                    <label htmlFor="file-input" className="flex flex-col items-center justify-center w-full h-40 border-2 border-dashed border-indigo-300 rounded-lg cursor-pointer bg-indigo-50 hover:bg-indigo-100 transition-all">
+                                        <FileUp className="w-10 h-10 text-indigo-500" />
+                                        <p className="mt-2 text-sm text-gray-600">
+                                            {file ? (
+                                                <span className="font-medium text-indigo-600">{file.name}</span>
+                                            ) : (
+                                                <span><span className="font-semibold text-indigo-600">Click to upload</span> a contract, policy, or photo of an agreement (PDF, JPG, PNG).</span>
+                                            )}
+                                        </p>
+                                        <p className="text-xs text-gray-500 mt-1">Maximum file size: 4MB (for quick processing)</p>
+                                    </label>
+                                    <input
+                                        id="file-input"
+                                        type="file"
+                                        className="hidden"
+                                        onChange={handleFileChange}
+                                        accept="application/pdf,image/jpeg,image/png"
+                                    />
+
+                                    <div className="flex flex-col md:flex-row space-y-4 md:space-y-0 md:space-x-4">
+                                        <button
+                                            onClick={handleAnalyze}
+                                            disabled={!file || loading}
+                                            className={`flex-1 px-6 py-3 rounded-lg font-bold text-white transition-all shadow-md
+                                                ${!file || loading ? 'bg-indigo-300 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 hover:shadow-lg'}
+                                            `}
+                                        >
+                                            {loading ? (
+                                                <span className="flex items-center justify-center">
+                                                    <Hourglass className="w-5 h-5 mr-2 animate-spin" /> Analyzing...
+                                                </span>
+                                            ) : (
+                                                <span className="flex items-center justify-center">
+                                                    <FileText className="w-5 h-5 mr-2" /> Generate Safety Report
+                                                </span>
+                                            )}
+                                        </button>
+                                        <button
+                                            onClick={handleReset}
+                                            className="md:w-auto px-6 py-3 bg-gray-200 text-gray-700 font-bold rounded-lg hover:bg-gray-300 transition-all shadow-md"
+                                        >
+                                            Reset
+                                        </button>
+                                    </div>
+
+                                    {error && (
+                                        <div className="p-4 bg-red-100 border border-red-400 text-red-700 rounded-lg shadow-sm">
+                                            <p className="font-semibold">Error:</p>
+                                            <p>{error}</p>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+
+                    {/* Report Display Section */}
+                    {report && (
+                        <section ref={reportRef} className="py-16 md:py-20 px-4 sm:px-6 lg:px-8 bg-gray-100">
+                            <div className="max-w-4xl mx-auto bg-white shadow-2xl rounded-xl p-6 md:p-10 border border-gray-200">
+                                <h2 className="text-3xl font-bold text-gray-800 mb-6 flex items-center print-visible">
+                                    <Shield className="w-6 h-6 mr-2 text-green-600" /> Exoner Safety Report
+                                </h2>
+
+                                {/* Print Button */}
+                                <div className="mb-6 text-right no-print">
+                                    <button
+                                        onClick={handlePrint}
+                                        className="inline-flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-md transition-colors"
+                                    >
+                                        <Printer className="w-5 h-5 mr-2" /> Print Report
+                                    </button>
+                                </div>
+
+                                {/* Overall Score */}
+                                <div className={`p-6 rounded-xl shadow-lg mb-8 ${scoreData.bgColor}`}>
+                                    <div className="flex items-center justify-between">
+                                        <div className="flex items-center">
+                                            <scoreData.icon className={`w-10 h-10 mr-4 ${scoreData.color}`} />
+                                            <div>
+                                                <p className="text-sm font-medium text-gray-600">Overall Safety Score</p>
+                                                <p className={`text-4xl font-extrabold ${scoreData.color}`}>{report.score}%</p>
+                                            </div>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-lg font-semibold text-gray-800">{scoreData.description}</p>
+                                        </div>
+                                    </div>
+                                    <p className="mt-4 text-gray-700 italic border-t pt-3">
+                                        {report.summary}
+                                    </p>
+                                </div>
+
+                                {/* Key Risks Breakdown */}
+                                <div className="mb-8">
+                                    <h3 className="text-2xl font-semibold text-gray-800 mb-4 flex items-center">
+                                        <AlertTriangle className="w-5 h-5 mr-2 text-orange-500" /> Key Risks Identified
+                                    </h3>
+                                    <div className="space-y-4">
+                                        {report.risks.length > 0 ? report.risks.map((risk, index) => (
+                                            <div key={index} className={`p-4 rounded-lg border-l-4 shadow-sm transition-all ${getRiskSeverityColor(risk.severity)}`}>
+                                                <p className="font-bold flex items-center justify-between">
+                                                    <span>{risk.title}</span>
+                                                    <span className={`text-xs font-extrabold px-3 py-1 rounded-full ${risk.severity === 'High' ? 'bg-red-200 text-red-800' : risk.severity === 'Medium' ? 'bg-orange-200 text-orange-800' : 'bg-lime-200 text-lime-800'}`}>
+                                                        {risk.severity} Severity
+                                                    </span>
+                                                </p>
+                                                <p className="mt-1 text-sm">{risk.description}</p>
+                                            </div>
+                                        )) : (
+                                            <p className="text-gray-500 italic">No specific high-severity risks were identified in the analyzed document.</p>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Privacy Policy Summary */}
+                                {report.privacyPolicy && (
+                                    <div className="mb-8 p-6 bg-gray-50 rounded-xl shadow-inner">
+                                        <h3 className="text-2xl font-semibold text-gray-800 mb-4 flex items-center">
+                                            <Shield className="w-5 h-5 mr-2 text-indigo-500" /> Privacy & Data Handling (Is it worth the stake?)
+                                        </h3>
+                                        <div className="space-y-3 text-gray-700">
+                                            <div className="p-3 border-l-4 border-indigo-400 bg-white rounded-md">
+                                                <p className="font-bold">Data Collected:</p>
+                                                <p className="text-sm">{report.privacyPolicy.dataCollected || 'Not specified or minimal.'}</p>
+                                            </div>
+                                            <div className="p-3 border-l-4 border-indigo-400 bg-white rounded-md">
+                                                <p className="font-bold">Third-Party Sharing:</p>
+                                                <p className="text-sm">{report.privacyPolicy.thirdPartySharing || 'No clear mention of third-party sharing.'}</p>
+                                            </div>
+                                            <div className="p-3 border-l-4 border-indigo-400 bg-white rounded-md">
+                                                <p className="font-bold">Data Retention:</p>
+                                                <p className="text-sm">{report.privacyPolicy.dataRetention || 'Policy on data retention is vague or absent.'}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Key Terminology Simplified */}
+                                <div>
+                                    <h3 className="text-2xl font-semibold text-gray-800 mb-4 flex items-center">
+                                        <FileText className="w-5 h-5 mr-2 text-blue-500" /> Legal Linguistics Simplified
+                                    </h3>
+                                    <div className="grid md:grid-cols-2 gap-4">
+                                        {report.keyTerms.map((item, index) => (
+                                            <div key={index} className="bg-blue-50 p-4 rounded-lg border border-blue-200 shadow-sm">
+                                                <p className="font-bold text-blue-700">{item.term}</p>
+                                                <p className="text-sm text-gray-700 mt-1">{item.explanation}</p>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+                    )}
+                </>
+            )}
+
+            {/* About Page View */}
+            {currentPage === 'about' && <AboutPage />}
+
+            {/* Simple Footer */}
+            <footer className="py-8 bg-gray-800 text-white text-center text-sm no-print">
+                <p>&copy; {new Date().getFullYear()} Exoner. All rights reserved.</p>
+            </footer>
+        </div>
+    );
+};
+
+export default App;
